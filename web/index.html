@@ -1,4 +1,71 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>法律证据保管</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>法律证据保管与流转</h1><div class="panel"><select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select><input id="case" value="1"><button onclick="load()">生成保管报告</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:16px system-ui;max-width:1080px;margin:32px auto;padding:0 16px}
+select,input,button{padding:8px;margin:4px}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}
+.ev{border:1px solid #ccc;border-radius:8px;padding:12px;margin:12px 0}
+.ev.held{border-color:#c0392b;background:#fdf0ef}
+.tag{display:inline-block;padding:2px 8px;border-radius:10px;background:#eee;margin:2px;font-size:13px}
+.tag.hold{background:#c0392b;color:#fff}
+.tag.ok{background:#27ae60;color:#fff}
+.msg{font-size:14px;margin-top:6px}
+.msg.err{color:#c0392b}.msg.ok{color:#27ae60}
+button.op{margin:2px}
+</style></head>
+<body><h1>法律证据保管与流转</h1>
+<div class="panel">
+身份 <select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select>
+案件 <input id="case" value="1" size="4">
+<button onclick="load()">生成保管报告</button>
+<span id="summary"></span>
+</div>
+<div id="items"></div>
+<pre id="out"></pre>
+<script>
+const $=id=>document.getElementById(id);
+const H=()=>({"Content-Type":"application/json","X-User-Id":$("user").value});
+const OP_NAME={open:"开箱",transfer:"移交",derive:"派生",release:"释放"};
+async function api(path,method,body){
+  const r=await fetch(path,{method,headers:H(),body:body?JSON.stringify(body):undefined});
+  const data=await r.json();
+  if(!r.ok)throw data.error||{code:"http_"+r.status,message:"请求失败 "+r.status};
+  return data;
+}
+function b64(s){return btoa(String.fromCharCode(...new TextEncoder().encode(s)))}
+function say(id,ok,text){const el=$("msg-"+id);el.className="msg "+(ok?"ok":"err");el.textContent=text}
+async function act(id,action){
+  try{
+    let r;
+    if(action==="hold_on"){const reason=prompt("法律保留原因（至少 5 字）");if(reason==null)return;r=await api(`/api/evidence/${id}/hold`,"POST",{hold:true,reason});}
+    else if(action==="hold_off"){const reason=prompt("解除保留原因（至少 5 字）");if(reason==null)return;r=await api(`/api/evidence/${id}/hold`,"POST",{hold:false,reason});}
+    else if(action==="open"){const location=prompt("开箱地点");if(location==null)return;const note=prompt("备注（可空）")||"";r=await api(`/api/evidence/${id}/open`,"POST",{location,note});}
+    else if(action==="transfer"){const to_person=prompt("接收人");if(to_person==null)return;const location=prompt("保管位置");if(location==null)return;const note=prompt("备注（可空）")||"";r=await api(`/api/evidence/${id}/transfer`,"POST",{to_person,location,note});}
+    else if(action==="derive"){const method=prompt("分析方法（至少 3 字）");if(method==null)return;const label=prompt("衍生证据标签");if(label==null)return;const filename=prompt("衍生文件名");if(filename==null)return;const content=prompt("衍生内容文本")||"";r=await api(`/api/evidence/${id}/derive`,"POST",{method,label,filename,content_b64:b64(content)});}
+    else if(action==="release"){const recipient=prompt("接收方");if(recipient==null)return;const note=prompt("备注（可空）")||"";r=await api(`/api/evidence/${id}/release`,"POST",{recipient,note});}
+    say(id,true,"操作成功："+JSON.stringify(r));
+  }catch(e){say(id,false,`被拒绝 [${e.code||"error"}]：${e.message||e}`)}
+  load();
+}
+async function load(){
+  try{
+    const r=await api(`/api/cases/${$("case").value}/report`,"GET");
+    $("out").textContent=JSON.stringify(r,null,2);
+    $("summary").textContent=`案件《${r.case.title}》 证据 ${r.evidence_count} 件，整体完整性：${r.overall_integrity_valid?"通过":"未通过"}`;
+    $("items").innerHTML=r.evidence.map(ev=>{
+      const src=ev.hold_sources.length?ev.hold_sources.map(s=>`#${s.evidence_id}（${s.label}）`).join("、"):"无";
+      const ops=ev.allowed_operations.length?ev.allowed_operations.map(o=>`<span class="tag ok">${OP_NAME[o]}</span>`).join(""):'<span class="tag hold">全部暂停</span>';
+      const holdTag=ev.legal_hold?'<span class="tag hold">本件已设保留</span>':"";
+      const effTag=ev.effective_hold?'<span class="tag hold">冻结生效中</span>':"";
+      const btn=(a,t)=>`<button class="op" onclick="act(${ev.id},'${a}')">${t}</button>`;
+      return `<div class="ev ${ev.effective_hold?"held":""}">
+        <b>#${ev.id} ${ev.label}</b>（${ev.filename}） 状态：${ev.status} 保管人：${ev.current_custodian} ${holdTag}${effTag}<br>
+        冻结来源：${src}<br>可办理操作：${ops}<br>
+        ${btn("hold_on","设置保留")}${btn("hold_off","解除保留")}${btn("open","开箱")}${btn("transfer","移交")}${btn("derive","派生")}${btn("release","释放")}
+        <div id="msg-${ev.id}" class="msg"></div>
+      </div>`;
+    }).join("");
+  }catch(e){$("items").innerHTML="";$("out").textContent=`加载失败 [${e.code||"error"}]：${e.message||e}`}
+}
+load();
+</script></body></html>

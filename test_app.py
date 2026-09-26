@@ -59,6 +59,63 @@ class CustodyTests(unittest.TestCase):
             self.store.release("custodian1", item["id"], "外部机构")
         self.assertEqual(ctx.exception.code, "legal_hold_active")
 
+    def test_hold_freezes_whole_derivative_chain_and_restores(self):
+        item = self.store.ingest_evidence(
+            "custodian1", self.case["id"], "E-003", "disk.img",
+            base64.b64encode(b"disk image").decode(), self.retention,
+        )
+        # 冻结原件后，开箱、移交、派生、释放全部暂停
+        self.store.set_hold("custodian1", item["id"], True, "法院诉讼保全裁定")
+        for action in (
+            lambda: self.store.open_evidence("custodian1", item["id"], "A 区证物室"),
+            lambda: self.store.transfer("custodian1", item["id"], "custodian2", "法院证物库"),
+            lambda: self.store.derive("analyst1", item["id"], "镜像提取", "E-003-D0", "x.json", base64.b64encode(b"{}").decode()),
+            lambda: self.store.release("custodian1", item["id"], "检察机关"),
+        ):
+            with self.assertRaises(BusinessError) as ctx:
+                action()
+            self.assertEqual(ctx.exception.code, "legal_hold_active")
+        # 解除后按原状态恢复：可开箱、可派生
+        self.store.set_hold("auditor1", item["id"], False, "保全裁定解除")
+        self.store.open_evidence("custodian1", item["id"], "A 区证物室")
+        child = self.store.derive(
+            "analyst1", item["id"], "镜像文件提取", "E-003-D1", "files.json",
+            base64.b64encode(b'["a.txt"]').decode(),
+        )
+        # 再次冻结原件：派生暂停，已有衍生证据也不能移交或释放
+        self.store.set_hold("auditor1", item["id"], True, "二审补充保全")
+        with self.assertRaises(BusinessError) as ctx:
+            self.store.derive("analyst1", item["id"], "二次提取", "E-003-D2", "y.json", base64.b64encode(b"{}").decode())
+        self.assertEqual(ctx.exception.code, "legal_hold_active")
+        for action in (
+            lambda: self.store.transfer("custodian1", child["id"], "custodian2", "分析实验室"),
+            lambda: self.store.release("custodian1", child["id"], "检察机关"),
+        ):
+            with self.assertRaises(BusinessError) as ctx:
+                action()
+            self.assertEqual(ctx.exception.code, "legal_hold_active")
+            self.assertIn(f"#{item['id']}", ctx.exception.message)
+        # 报告标注冻结来源与可办理操作
+        report = self.store.report("auditor1", self.case["id"])
+        original = next(x for x in report["evidence"] if x["id"] == item["id"])
+        derivative = next(x for x in report["evidence"] if x["id"] == child["id"])
+        self.assertTrue(original["legal_hold"])
+        self.assertEqual(original["allowed_operations"], [])
+        self.assertFalse(derivative["legal_hold"])
+        self.assertTrue(derivative["effective_hold"])
+        self.assertEqual(derivative["hold_sources"], [{"evidence_id": item["id"], "label": "E-003"}])
+        self.assertEqual(derivative["allowed_operations"], [])
+        # 解除后各自按原状态恢复：衍生证据可移交、可释放，原件可移交
+        self.store.set_hold("custodian1", item["id"], False, "二审保全期满解除")
+        self.store.transfer("custodian1", child["id"], "custodian2", "分析实验室")
+        self.store.release("custodian2", child["id"], "检察机关")
+        report = self.store.report("auditor1", self.case["id"])
+        original = next(x for x in report["evidence"] if x["id"] == item["id"])
+        derivative = next(x for x in report["evidence"] if x["id"] == child["id"])
+        self.assertEqual(original["allowed_operations"], ["derive", "transfer", "release"])
+        self.assertEqual(derivative["status"], "released")
+        self.assertEqual(derivative["allowed_operations"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

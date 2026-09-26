@@ -237,12 +237,51 @@ class CustodyStore:
             raise BusinessError("证据不存在", 404, "not_found")
         return row
 
+    def _hold_sources(self, conn, evidence_id):
+        """沿派生链向上收集生效中的法律保留来源（含自身），冻结覆盖整条关系链。"""
+        sources, seen, current = [], set(), evidence_id
+        while current is not None and current not in seen:
+            seen.add(current)
+            row = conn.execute("SELECT id,label,legal_hold FROM evidence WHERE id=?", (current,)).fetchone()
+            if row is None:
+                break
+            if row["legal_hold"]:
+                sources.append({"evidence_id": row["id"], "label": row["label"]})
+            parent = conn.execute(
+                "SELECT parent_evidence_id FROM derivatives WHERE child_evidence_id=?", (current,)
+            ).fetchone()
+            current = parent["parent_evidence_id"] if parent else None
+        return sources
+
+    @staticmethod
+    def _allowed_operations(status, held):
+        if held:
+            return []
+        ops = []
+        if status == "custody":
+            ops.append("open")
+        if status == "opened":
+            ops.append("derive")
+        if status != "released":
+            ops.extend(["transfer", "release"])
+        return ops
+
+    def _assert_not_held(self, conn, evidence_id, action):
+        sources = self._hold_sources(conn, evidence_id)
+        if sources:
+            origin = "、".join(f"#{s['evidence_id']}（{s['label']}）" for s in sources)
+            raise BusinessError(f"法律保留生效中，冻结来源：{origin}，已暂停{action}", 409, "legal_hold_active")
+
     def get_evidence(self, user_id, evidence_id, include_content=False):
         with self.connect() as conn:
             row = self._evidence(conn, evidence_id)
             self._member(conn, row["case_id"], user_id)
             result = {k: row[k] for k in row.keys() if k != "content"}
             result["legal_hold"] = bool(row["legal_hold"])
+            sources = self._hold_sources(conn, evidence_id)
+            result["hold_sources"] = sources
+            result["effective_hold"] = bool(sources)
+            result["allowed_operations"] = self._allowed_operations(row["status"], bool(sources))
             result["integrity_valid"] = hashlib.sha256(row["content"]).hexdigest() == row["sha256"]
             result["events"] = [dict(x) for x in conn.execute("SELECT * FROM custody_events WHERE evidence_id=? ORDER BY sequence", (evidence_id,)).fetchall()]
             result["derived_children"] = [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (evidence_id,)).fetchall()]
@@ -258,6 +297,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                self._assert_not_held(conn, evidence_id, "移交")
                 if row["status"] == "released":
                     raise BusinessError("已释放证据不能再移交", 409, "evidence_released")
                 self._append_event(conn, evidence_id, "TRANSFER", user_id, from_person=row["current_custodian"], to_person=to_person.strip(), location=location.strip(), note=note.strip())
@@ -276,6 +316,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                self._assert_not_held(conn, evidence_id, "开箱")
                 if row["status"] != "custody":
                     raise BusinessError("只有处于封存保管状态的证据可以开箱", 409, "invalid_status")
                 self._append_event(conn, evidence_id, "OPEN", user_id, from_person=row["current_custodian"], location=location.strip(), note=note.strip())
@@ -299,6 +340,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 parent = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, parent["case_id"], user_id, {"analyst"})
+                self._assert_not_held(conn, evidence_id, "派生")
                 if parent["status"] != "opened":
                     raise BusinessError("原始证据必须先开箱才能分析", 409, "evidence_not_opened")
                 cur = conn.execute(
@@ -344,8 +386,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
-                if row["legal_hold"]:
-                    raise BusinessError("存在法律保留，禁止释放证据", 409, "legal_hold_active")
+                self._assert_not_held(conn, evidence_id, "释放")
                 if row["status"] == "released":
                     raise BusinessError("证据已经释放", 409, "already_released")
                 self._append_event(conn, evidence_id, "RELEASE", user_id, from_person=row["current_custodian"], to_person=recipient.strip(), note=note.strip())
@@ -375,10 +416,13 @@ class CustodyStore:
                         chain_valid = False
                     expected_prev = e["event_hash"]
                 all_valid = all_valid and hash_valid and chain_valid
+                sources = self._hold_sources(conn, row["id"])
                 items.append({
                     "id": row["id"], "label": row["label"], "filename": row["filename"], "sha256": row["sha256"],
                     "size": row["size"], "status": row["status"], "current_custodian": row["current_custodian"],
                     "legal_hold": bool(row["legal_hold"]), "retention_until": row["retention_until"],
+                    "hold_sources": sources, "effective_hold": bool(sources),
+                    "allowed_operations": self._allowed_operations(row["status"], bool(sources)),
                     "hash_valid": hash_valid, "chain_valid": chain_valid,
                     "events": [dict(e) for e in events],
                     "derivatives": [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (row["id"],)).fetchall()],

@@ -26,9 +26,9 @@ python3 -m unittest -v
 - `POST /api/evidence/{id}/open`：保管员开箱。
 - `POST /api/evidence/{id}/transfer`：移交保管人并记录位置。
 - `POST /api/evidence/{id}/derive`：分析员从已开箱证据创建衍生证据。
-- `POST /api/evidence/{id}/hold`：审计员或案件创建人设置/解除法律保留。
-- `POST /api/evidence/{id}/release`：存在法律保留时拒绝释放。
-- `GET /api/cases/{id}/report`：校验所有证据哈希和每条事件链，导出完整报告。
+- `POST /api/evidence/{id}/hold`：审计员或案件创建人设置/解除法律保留。冻结沿派生链生效：被冻结原件的开箱、移交、派生、释放全部暂停，其已有衍生证据也不能再移交或释放；解除后各证据按原状态恢复。
+- `POST /api/evidence/{id}/release`：证据自身或其上游任一派生来源存在法律保留时拒绝释放，错误信息注明冻结来源。
+- `GET /api/cases/{id}/report`：校验所有证据哈希和每条事件链，导出完整报告；每件证据标注 `hold_sources`（冻结来源）、`effective_hold`（冻结是否生效）和 `allowed_operations`（当前可办理操作）。
 - 所有 `DELETE` 请求返回 405；证据和保管记录不提供删除接口。
 
 保管事件通过前一条事件哈希串联；报告会重新计算文件哈希和事件链。项目适合流程与完整性原型，不涵盖现实中的签名证书、WORM 存储、证据文件加密或司法辖区合规认证。
