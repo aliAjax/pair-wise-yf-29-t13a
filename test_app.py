@@ -59,6 +59,103 @@ class CustodyTests(unittest.TestCase):
             self.store.release("custodian1", item["id"], "外部机构")
         self.assertEqual(ctx.exception.code, "legal_hold_active")
 
+    def test_hold_freezes_original_operations_until_cleared(self):
+        item = self.store.ingest_evidence(
+            "custodian1", self.case["id"], "E-100", "disk.img",
+            base64.b64encode(b"disk-bytes").decode(), self.retention,
+        )
+        self.store.set_hold("custodian1", item["id"], True, "法院诉讼保全裁定")
+        for action in (
+            lambda: self.store.open_evidence("custodian1", item["id"], "证物室"),
+            lambda: self.store.transfer("custodian1", item["id"], "custodian2", "证物库"),
+            lambda: self.store.derive(
+                "analyst1", item["id"], "镜像哈希校验", "E-100-D1", "hash.txt",
+                base64.b64encode(b"x").decode(),
+            ),
+        ):
+            with self.assertRaises(BusinessError) as ctx:
+                action()
+            self.assertEqual(ctx.exception.code, "legal_hold_frozen")
+        with self.assertRaises(BusinessError) as ctx:
+            self.store.release("custodian1", item["id"], "检察机关")
+        self.assertEqual(ctx.exception.code, "legal_hold_active")
+        view = self.store.get_evidence("auditor1", item["id"])
+        self.assertTrue(view["frozen"])
+        self.assertEqual(view["hold_source"], {"type": "direct", "evidence_id": item["id"]})
+        self.assertEqual(view["allowed_operations"], [])
+        self.store.set_hold("custodian1", item["id"], False, "裁定解除，恢复办理")
+        opened = self.store.open_evidence("custodian1", item["id"], "证物室")
+        self.assertEqual(opened["status"], "opened")
+        view = self.store.get_evidence("custodian1", item["id"])
+        self.assertFalse(view["frozen"])
+        self.assertIsNone(view["hold_source"])
+        self.assertEqual(view["allowed_operations"], ["transfer", "derive", "release"])
+
+    def test_hold_on_original_freezes_derivative_chain(self):
+        item = self.store.ingest_evidence(
+            "custodian1", self.case["id"], "E-200", "mail.pst",
+            base64.b64encode(b"mailbox").decode(), self.retention,
+        )
+        self.store.open_evidence("custodian1", item["id"], "证物室")
+        child = self.store.derive(
+            "analyst1", item["id"], "CSV 提取交易记录", "E-200-D1", "tx.json",
+            base64.b64encode(b"[]").decode(),
+        )
+        self.store.transfer("custodian1", child["id"], "custodian2", "分析实验室")
+        self.store.set_hold("auditor1", item["id"], True, "检察监督冻结要求")
+        with self.assertRaises(BusinessError) as ctx:
+            self.store.transfer("custodian1", item["id"], "custodian2", "法院证物库")
+        self.assertEqual(ctx.exception.code, "legal_hold_frozen")
+        with self.assertRaises(BusinessError) as ctx:
+            self.store.derive(
+                "analyst1", item["id"], "再次提取", "E-200-D2", "x.json",
+                base64.b64encode(b"{}").decode(),
+            )
+        self.assertEqual(ctx.exception.code, "legal_hold_frozen")
+        with self.assertRaises(BusinessError) as ctx:
+            self.store.transfer("custodian1", child["id"], "custodian1", "证物室")
+        self.assertEqual(ctx.exception.code, "legal_hold_frozen")
+        with self.assertRaises(BusinessError) as ctx:
+            self.store.release("custodian1", child["id"], "外部机构")
+        self.assertEqual(ctx.exception.code, "legal_hold_active")
+        view = self.store.get_evidence("auditor1", child["id"])
+        self.assertTrue(view["frozen"])
+        self.assertEqual(view["hold_source"], {"type": "inherited", "ancestors": [item["id"]]})
+        self.assertEqual(view["allowed_operations"], [])
+        report = self.store.report("auditor1", self.case["id"])
+        original = next(x for x in report["evidence"] if x["id"] == item["id"])
+        derived = next(x for x in report["evidence"] if x["id"] == child["id"])
+        self.assertEqual(original["hold_source"], {"type": "direct", "evidence_id": item["id"]})
+        self.assertEqual(derived["hold_source"], {"type": "inherited", "ancestors": [item["id"]]})
+        self.assertEqual(original["allowed_operations"], [])
+        self.assertEqual(derived["allowed_operations"], [])
+        self.store.set_hold("auditor1", item["id"], False, "冻结期满解除")
+        restored = self.store.get_evidence("auditor1", item["id"])
+        self.assertFalse(restored["frozen"])
+        self.assertEqual(restored["allowed_operations"], ["transfer", "derive", "release"])
+        moved = self.store.transfer("custodian1", child["id"], "custodian1", "证物室")
+        self.assertEqual(moved["current_custodian"], "custodian1")
+        done = self.store.release("custodian1", child["id"], "检察机关")
+        self.assertEqual(done["status"], "released")
+
+    def test_hold_on_derivative_does_not_freeze_parent(self):
+        item = self.store.ingest_evidence(
+            "custodian1", self.case["id"], "E-300", "log.zip",
+            base64.b64encode(b"logs").decode(), self.retention,
+        )
+        self.store.open_evidence("custodian1", item["id"], "证物室")
+        child = self.store.derive(
+            "analyst1", item["id"], "日志关键字命中", "E-300-D1", "hits.txt",
+            base64.b64encode(b"hit").decode(),
+        )
+        self.store.set_hold("auditor1", child["id"], True, "衍生报告涉诉保全")
+        parent_view = self.store.get_evidence("auditor1", item["id"])
+        self.assertFalse(parent_view["frozen"])
+        self.store.transfer("custodian1", item["id"], "custodian2", "证物库")
+        child_view = self.store.get_evidence("auditor1", child["id"])
+        self.assertTrue(child_view["frozen"])
+        self.assertEqual(child_view["hold_source"], {"type": "direct", "evidence_id": child["id"]})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -237,12 +237,62 @@ class CustodyStore:
             raise BusinessError("证据不存在", 404, "not_found")
         return row
 
+    def _freeze_info(self, conn, evidence_id):
+        """法律保留冻结整条证据关系链：本证据被直接保留，或任一上游祖先被保留，都视为冻结。"""
+        row = self._evidence(conn, evidence_id)
+        if row["legal_hold"]:
+            return {"frozen": True, "source": {"type": "direct", "evidence_id": evidence_id}}
+        held = conn.execute(
+            """WITH RECURSIVE ancestors(id) AS (
+                   SELECT parent_evidence_id FROM derivatives WHERE child_evidence_id=?
+                   UNION
+                   SELECT d.parent_evidence_id FROM derivatives d
+                   JOIN ancestors a ON d.child_evidence_id=a.id
+               )
+               SELECT DISTINCT e.id AS id FROM evidence e JOIN ancestors a ON e.id=a.id
+               WHERE e.legal_hold=1""",
+            (evidence_id,),
+        ).fetchall()
+        if held:
+            return {"frozen": True, "source": {"type": "inherited", "ancestors": sorted(r["id"] for r in held)}}
+        return {"frozen": False, "source": None}
+
+    def _require_unfrozen(self, conn, evidence_id, action, code="legal_hold_frozen"):
+        info = self._freeze_info(conn, evidence_id)
+        if not info["frozen"]:
+            return
+        source = info["source"]
+        if source["type"] == "direct":
+            detail = "本证据已设置法律保留"
+        else:
+            detail = "上游证据 " + "、".join(f"#{i}" for i in source["ancestors"]) + " 处于法律保留"
+        raise BusinessError(f"法律保留冻结中（{detail}），暂停{action}", 409, code)
+
+    @staticmethod
+    def _allowed_operations(status, frozen):
+        if frozen:
+            return []
+        ops = []
+        if status == "custody":
+            ops.append("open")
+        if status != "released":
+            ops.append("transfer")
+        if status == "opened":
+            ops.append("derive")
+        if status != "released":
+            ops.append("release")
+        return ops
+
     def get_evidence(self, user_id, evidence_id, include_content=False):
         with self.connect() as conn:
             row = self._evidence(conn, evidence_id)
             self._member(conn, row["case_id"], user_id)
             result = {k: row[k] for k in row.keys() if k != "content"}
             result["legal_hold"] = bool(row["legal_hold"])
+            freeze = self._freeze_info(conn, evidence_id)
+            result["frozen"] = freeze["frozen"]
+            result["hold_source"] = freeze["source"]
+            result["allowed_operations"] = self._allowed_operations(row["status"], freeze["frozen"])
             result["integrity_valid"] = hashlib.sha256(row["content"]).hexdigest() == row["sha256"]
             result["events"] = [dict(x) for x in conn.execute("SELECT * FROM custody_events WHERE evidence_id=? ORDER BY sequence", (evidence_id,)).fetchall()]
             result["derived_children"] = [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (evidence_id,)).fetchall()]
@@ -258,6 +308,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                self._require_unfrozen(conn, evidence_id, "移交")
                 if row["status"] == "released":
                     raise BusinessError("已释放证据不能再移交", 409, "evidence_released")
                 self._append_event(conn, evidence_id, "TRANSFER", user_id, from_person=row["current_custodian"], to_person=to_person.strip(), location=location.strip(), note=note.strip())
@@ -276,6 +327,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                self._require_unfrozen(conn, evidence_id, "开箱")
                 if row["status"] != "custody":
                     raise BusinessError("只有处于封存保管状态的证据可以开箱", 409, "invalid_status")
                 self._append_event(conn, evidence_id, "OPEN", user_id, from_person=row["current_custodian"], location=location.strip(), note=note.strip())
@@ -299,6 +351,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 parent = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, parent["case_id"], user_id, {"analyst"})
+                self._require_unfrozen(conn, evidence_id, "派生")
                 if parent["status"] != "opened":
                     raise BusinessError("原始证据必须先开箱才能分析", 409, "evidence_not_opened")
                 cur = conn.execute(
@@ -344,8 +397,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
-                if row["legal_hold"]:
-                    raise BusinessError("存在法律保留，禁止释放证据", 409, "legal_hold_active")
+                self._require_unfrozen(conn, evidence_id, "释放", code="legal_hold_active")
                 if row["status"] == "released":
                     raise BusinessError("证据已经释放", 409, "already_released")
                 self._append_event(conn, evidence_id, "RELEASE", user_id, from_person=row["current_custodian"], to_person=recipient.strip(), note=note.strip())
@@ -375,10 +427,13 @@ class CustodyStore:
                         chain_valid = False
                     expected_prev = e["event_hash"]
                 all_valid = all_valid and hash_valid and chain_valid
+                freeze = self._freeze_info(conn, row["id"])
                 items.append({
                     "id": row["id"], "label": row["label"], "filename": row["filename"], "sha256": row["sha256"],
                     "size": row["size"], "status": row["status"], "current_custodian": row["current_custodian"],
                     "legal_hold": bool(row["legal_hold"]), "retention_until": row["retention_until"],
+                    "frozen": freeze["frozen"], "hold_source": freeze["source"],
+                    "allowed_operations": self._allowed_operations(row["status"], freeze["frozen"]),
                     "hash_valid": hash_valid, "chain_valid": chain_valid,
                     "events": [dict(e) for e in events],
                     "derivatives": [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (row["id"],)).fetchall()],
